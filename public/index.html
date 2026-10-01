@@ -12,6 +12,7 @@
     <nav class="tabs">
       <button id="tabDraft" class="tab active">草稿编辑</button>
       <button id="tabPublished" class="tab">已发布图纸</button>
+      <button id="tabProduction" class="tab">铅条生产</button>
     </nav>
   </header>
 
@@ -107,6 +108,65 @@
     </aside>
     <section class="canvas-wrap">
       <canvas id="pubCanvas" width="900" height="640"></canvas>
+    </section>
+  </main>
+
+  <!-- ============ 生产视图 ============ -->
+  <main id="viewProduction" class="view" hidden>
+    <aside class="panel">
+      <section>
+        <h2>① 原材库存</h2>
+        <div id="matList"></div>
+        <details>
+          <summary>登记原材规格与库存根数</summary>
+          <div class="form-row">
+            <label>规格名称<input id="matName" type="text" placeholder="如：6m 通用铅条" maxlength="80"></label>
+          </div>
+          <div class="form-row two">
+            <label>定尺 (mm)<input id="matLength" type="number" min="0.01" step="0.01" value="6000"></label>
+            <label>库存根数<input id="matStock" type="number" min="0" step="1" value="10"></label>
+          </div>
+          <button id="btnMatAdd" class="primary">登记</button>
+          <div id="matMsg" class="hint"></div>
+        </details>
+      </section>
+
+      <section>
+        <h2>② 制作生产计划（草稿）</h2>
+        <div class="form-row">
+          <label>计划名称<input id="planName" type="text" placeholder="留空自动命名" maxlength="80"></label>
+        </div>
+        <label>图纸
+          <select id="planDesignSelect"></select>
+        </label>
+        <label>发布版本
+          <select id="planVersionSelect"></select>
+        </label>
+        <label>原材规格
+          <select id="planMaterialSelect"></select>
+        </label>
+        <div class="form-row two">
+          <label>件数（正数）<input id="planCopies" type="number" min="1" step="1" value="1"></label>
+          <label>每刀损耗 (mm)<input id="planKerf" type="number" min="0" step="0.01" value="0.5"></label>
+        </div>
+        <div class="btn-row">
+          <button id="btnPlanPreview" class="primary big">排产预览（不占库存）</button>
+        </div>
+        <div id="planMsg" class="hint"></div>
+      </section>
+
+      <section>
+        <h2>③ 计划列表</h2>
+        <div id="planList"></div>
+      </section>
+    </aside>
+
+    <section class="canvas-wrap">
+      <div id="prodBanner" class="banner" hidden></div>
+      <div id="previewBox" class="lead-panel">
+        <h2>排产预览 / 计划详情</h2>
+        <div id="previewContent" class="hint">在左侧选择发布版本、件数、原材规格与每刀损耗，点击“排产预览”。</div>
+      </div>
     </section>
   </main>
 

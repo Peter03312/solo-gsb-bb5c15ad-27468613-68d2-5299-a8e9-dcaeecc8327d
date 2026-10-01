@@ -168,3 +168,37 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .gap-info { font-size: 12px; color: #8a5a00; line-height: 1.6; }
 
 .pub-link { color: var(--primary); }
+
+/* ---------- 铅条生产 ---------- */
+.plan-head { margin-bottom: 8px; line-height: 1.7; }
+.stock-badge {
+  display: inline-block; padding: 6px 12px; border-radius: 8px;
+  font-size: 13px; margin: 6px 0 10px;
+}
+.stock-badge.ok { background: var(--ok-bg); color: var(--ok); border: 1px solid #9cc9ab; }
+.stock-badge.bad { background: var(--danger-bg); color: var(--danger); border: 1px solid #e6a89f; }
+.stock-badge.cancel { background: #eee; color: #777; border: 1px solid #ccc; }
+
+.bars { display: flex; flex-direction: column; gap: 12px; margin-top: 10px; }
+.bar-card {
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: #fcfbf8;
+}
+.bar-title { font-size: 13px; margin-bottom: 6px; }
+.track {
+  position: relative; height: 20px; background: #eee; border-radius: 4px;
+  overflow: hidden; margin: 6px 0 8px; border: 1px solid var(--line);
+}
+.track .seg { position: absolute; top: 0; bottom: 0; border-right: 1px solid rgba(255,255,255,.7); }
+.track .rem { position: absolute; top: 0; bottom: 0; background: repeating-linear-gradient(45deg,#e2ddd2,#e2ddd2 5px,#d5cfc1 5px,#d5cfc1 10px); }
+
+.plan-item {
+  padding: 7px 8px; border: 1px solid var(--line); border-radius: 8px;
+  margin-bottom: 6px; cursor: pointer; font-size: 13px; line-height: 1.6;
+}
+.plan-item:hover { background: #f2efe7; }
+.plan-item.active { border-color: var(--primary); background: #eef3fa; }
+.stock-edit { display: inline-block; }
+
+#viewProduction .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; }
+#viewProduction .badge.ok { background: var(--ok-bg); color: var(--ok); }
+#viewProduction .badge.bad { background: var(--danger-bg); color: var(--danger); }

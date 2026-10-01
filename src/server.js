@@ -4,6 +4,7 @@ const path = require('path');
 const express = require('express');
 const db = require('./db');
 const geo = require('./geometry');
+const cut = require('./cutting');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'studio.db');
@@ -247,6 +248,374 @@ app.get('/api/designs/:designId/publications/:version', (req, res) => {
   res.json({ ok: true, publication: pub });
 });
 
+// ---------- 铅条原材库存 ----------
+
+const MATERIAL_NAME_MAX = 80;
+
+app.get('/api/materials', (req, res) => {
+  res.json({ ok: true, materials: db.listMaterials() });
+});
+
+app.get('/api/materials/:materialId', (req, res) => {
+  const material = db.getMaterial(Number(req.params.materialId));
+  if (!material) return fail(res, 404, '原材规格不存在');
+  res.json({ ok: true, material });
+});
+
+app.post('/api/materials', (req, res) => {
+  const body = req.body || {};
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  if (!name) return fail(res, 400, '规格名称必填');
+  if (name.length > MATERIAL_NAME_MAX) return fail(res, 400, `规格名称不得超过 ${MATERIAL_NAME_MAX} 字`);
+  const len = cut.parseLen2(Number(body.length), { name: '原材定尺', positive: true });
+  if (!len.ok) return fail(res, 400, len.error);
+  const stock = cut.parseNonNegInt(Number(body.stock), { name: '库存根数', max: 1e9 });
+  if (!stock.ok) return fail(res, 400, stock.error);
+  if (db.getMaterialByName(name)) return fail(res, 409, '同名规格已存在');
+  const material = db.createMaterial({ name, lengthH: len.h, stock: stock.n });
+  res.status(201).json({ ok: true, material });
+});
+
+// 修改规格名/库存根数（定尺不可改）。库存不得小于已预留根数。
+app.patch('/api/materials/:materialId', (req, res) => {
+  const material = db.getMaterial(Number(req.params.materialId));
+  if (!material) return fail(res, 404, '原材规格不存在');
+  const body = req.body || {};
+  const fields = {};
+  if (body.name !== undefined) {
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    if (!name) return fail(res, 400, '规格名称必填');
+    if (name.length > MATERIAL_NAME_MAX) return fail(res, 400, `规格名称不得超过 ${MATERIAL_NAME_MAX} 字`);
+    fields.name = name;
+  }
+  if (body.stock !== undefined) {
+    const stock = cut.parseNonNegInt(Number(body.stock), { name: '库存根数', max: 1e9 });
+    if (!stock.ok) return fail(res, 400, stock.error);
+    fields.stock = stock.n;
+  }
+  if (body.length !== undefined) {
+    return fail(res, 400, '定尺属于规格身份不可修改；请新建规格');
+  }
+  if (!('name' in fields) && !('stock' in fields)) {
+    return fail(res, 400, '没有可更新字段（name 或 stock）');
+  }
+  const r = db.updateMaterial(material.id, fields);
+  if (r.code === 'name_taken') return fail(res, 409, '同名规格已存在');
+  if (r.code === 'stock_below_reserved') {
+    return fail(res, 409, `库存不得小于已确认计划预留根数（${r.reserved}）`, { reserved: r.reserved });
+  }
+  res.json({ ok: true, material: r.material });
+});
+
+// ---------- 铅条生产计划 ----------
+
+const PLAN_NAME_MAX = 80;
+const COPIES_MAX = 10000;
+
+// 解析并校验排产参数；返回 { error }（HTTP 层据此拒绝，且绝不改库存）或 { pub, material, copies, kerfH }
+function resolvePlanInputs(body) {
+  const publicationId = Number(body.publicationId);
+  if (!Number.isInteger(publicationId) || publicationId <= 0) {
+    return { error: 'publicationId 必须是已发布版本的正整数 id' };
+  }
+  const pub = db.getPublicationById(publicationId);
+  if (!pub) return { error: '发布版不存在', status: 404 };
+
+  const materialId = Number(body.materialId);
+  if (!Number.isInteger(materialId) || materialId <= 0) {
+    return { error: 'materialId 必须是原材规格的正整数 id' };
+  }
+  const material = db.getMaterial(materialId);
+  if (!material) return { error: '原材规格不存在', status: 404 };
+  // 精确定尺（整数厘）取自数据库原始行，不走毫米浮点往返
+  const materialRow = db.getMaterialRow(materialId);
+  material.lengthH = materialRow.length_h;
+
+  const copiesR = cut.parsePositiveInt(Number(body.copies), { name: '件数', max: COPIES_MAX });
+  if (!copiesR.ok) return { error: copiesR.error };
+
+  const kerfR = cut.parseLen2(Number(body.kerf), { name: '每刀损耗', positive: false });
+  if (!kerfR.ok) return { error: kerfR.error };
+
+  return { pub, material, copies: copiesR.n, kerfH: kerfR.h };
+}
+
+// 依据发布快照 + 参数生成切段方案（长度均换算为毫米输出，不访问/修改库存计数）
+function buildPlanLayout({ pub, material, copies, kerfH }) {
+  const segs = cut.segmentsFromSnapshot(pub.snapshot);
+  if (!segs.ok) return { error: segs.error };
+  const result = cut.planCuts({
+    segments: segs.segments,
+    copies,
+    stockLenH: material.lengthH,
+    kerfH,
+  });
+  if (!result.ok) {
+    if (result.code === 'segment_too_long') {
+      return {
+        error: result.error,
+        status: 422,
+        code: result.code,
+        segment: serializeSegmentBrief(result.segment, kerfH),
+      };
+    }
+    return { error: result.error, status: 400, code: result.code };
+  }
+  return { layout: serializeLayout(result, material) };
+}
+
+function serializeSegmentBrief(seg, kerfH) {
+  return {
+    name: seg.name,
+    source: seg.source,
+    length: cut.hToMm(seg.lengthH),
+    withKerf: cut.hToMm(seg.lengthH + kerfH),
+  };
+}
+
+function serializeLayout(result, material) {
+  const kerfH = result.segmentCount ? result.totalKerfH / result.segmentCount : 0;
+  return {
+    materialLength: cut.hToMm(material.lengthH),
+    kerf: cut.hToMm(kerfH),
+    segmentCount: result.segmentCount,
+    requiredBars: result.requiredBars,
+    totals: {
+      segmentCount: result.segmentCount,
+      finishedLength: cut.hToMm(result.totalFinishedH),
+      kerfTotal: cut.hToMm(result.totalKerfH),
+      remainderTotal: cut.hToMm(result.totalRemainderH),
+    },
+    bars: result.bars.map((b) => ({
+      index: b.index,
+      usedLength: cut.hToMm(b.usedH),
+      remainder: cut.hToMm(b.remainderH),
+      cuts: b.cuts.map((c) => ({
+        piece: c.piece,
+        source: c.source,
+        sourceNo: c.sourceNo,
+        name: c.name,
+        length: cut.hToMm(c.lengthH),
+        kerf: cut.hToMm(c.kerfH),
+        from: c.from,
+        to: c.to,
+      })),
+    })),
+  };
+}
+
+// 预览（POST /api/plans/preview）：不落库、不预留
+app.post('/api/plans/preview', (req, res) => {
+  const body = req.body || {};
+  const inp = resolvePlanInputs(body);
+  if (inp.error) return fail(res, inp.status || 400, inp.error);
+  const built = buildPlanLayout(inp);
+  if (built.error) {
+    return res.status(built.status || 400).json({
+      ok: false, error: built.error, code: built.code, segment: built.segment || undefined,
+    });
+  }
+  const material = db.getMaterial(inp.material.id); // 取最新 stock/reserved/available
+  const shortage = Math.max(0, built.layout.requiredBars - material.available);
+  res.json({
+    ok: true,
+    preview: {
+      publicationId: inp.pub.id,
+      designId: inp.pub.designId,
+      version: inp.pub.version,
+      copies: inp.copies,
+      kerf: cut.hToMm(inp.kerfH),
+      material: materialBrief(material),
+      layout: built.layout,
+      requiredBars: built.layout.requiredBars,
+      availableBars: material.available,
+      shortage,
+      feasible: shortage === 0,
+    },
+  });
+});
+
+// 建草稿计划
+app.post('/api/plans', (req, res) => {
+  const body = req.body || {};
+  const inp = resolvePlanInputs(body);
+  if (inp.error) return fail(res, inp.status || 400, inp.error);
+  const built = buildPlanLayout(inp);
+  if (built.error) {
+    return res.status(built.status || 400).json({
+      ok: false, error: built.error, code: built.code, segment: built.segment || undefined,
+    });
+  }
+  const name = typeof body.name === 'string' && body.name.trim()
+    ? body.name.trim().slice(0, PLAN_NAME_MAX)
+    : `v${inp.pub.version} ×${inp.copies}件 · ${inp.material.name}`;
+  const plan = db.createPlan({
+    name,
+    publicationId: inp.pub.id,
+    designId: inp.pub.designId,
+    version: inp.pub.version,
+    materialId: inp.material.id,
+    materialName: inp.material.name,
+    materialLengthH: inp.material.lengthH,
+    copies: inp.copies,
+    kerfH: inp.kerfH,
+    requiredBars: built.layout.requiredBars,
+    segmentCount: built.layout.segmentCount,
+    layout: built.layout,
+  });
+  res.status(201).json({ ok: true, plan: serializePlan(plan) });
+});
+
+app.get('/api/plans', (req, res) => {
+  res.json({ ok: true, plans: db.listPlans().map(serializePlan) });
+});
+
+app.get('/api/plans/:planId', (req, res) => {
+  const plan = db.getPlan(Number(req.params.planId));
+  if (!plan) return fail(res, 404, '生产计划不存在');
+  res.json({ ok: true, plan: serializePlan(plan) });
+});
+
+// 修改草稿（重新选版本/件数/原材/刀损并重算切段）
+app.put('/api/plans/:planId', (req, res) => {
+  const plan = db.getPlan(Number(req.params.planId));
+  if (!plan) return fail(res, 404, '生产计划不存在');
+  if (plan.status !== 'draft') {
+    return fail(res, 409, `仅草稿计划可修改（当前为 ${statusZh(plan.status)}）`);
+  }
+  const body = req.body || {};
+  // 未传字段沿用旧值
+  const merged = {
+    publicationId: body.publicationId !== undefined ? Number(body.publicationId) : plan.publicationId,
+    materialId: body.materialId !== undefined ? Number(body.materialId) : plan.materialId,
+    copies: body.copies !== undefined ? Number(body.copies) : plan.copies,
+    kerf: body.kerf !== undefined ? Number(body.kerf) : plan.kerf,
+  };
+  const inp = resolvePlanInputs(merged);
+  if (inp.error) return fail(res, inp.status || 400, inp.error);
+  const built = buildPlanLayout(inp);
+  if (built.error) {
+    return res.status(built.status || 400).json({
+      ok: false, error: built.error, code: built.code, segment: built.segment || undefined,
+    });
+  }
+  const name = typeof body.name === 'string' && body.name.trim()
+    ? body.name.trim().slice(0, PLAN_NAME_MAX)
+    : plan.name;
+  const r = db.updatePlanDraft(plan.id, {
+    name,
+    publicationId: inp.pub.id,
+    designId: inp.pub.designId,
+    version: inp.pub.version,
+    materialId: inp.material.id,
+    materialName: inp.material.name,
+    materialLengthH: inp.material.lengthH,
+    copies: inp.copies,
+    kerfH: inp.kerfH,
+    requiredBars: built.layout.requiredBars,
+    segmentCount: built.layout.segmentCount,
+    layout: built.layout,
+  });
+  if (r.code !== 'ok') return fail(res, 409, '计划状态已变化，请刷新后重试');
+  res.json({ ok: true, plan: serializePlan(r.plan) });
+});
+
+// 确认：原子预留库存；重复确认不会重复扣减
+app.post('/api/plans/:planId/confirm', (req, res) => {
+  const plan = db.getPlan(Number(req.params.planId));
+  if (!plan) return fail(res, 404, '生产计划不存在');
+  const r = db.confirmPlan(plan.id);
+  if (r.code === 'already_confirmed') {
+    return res.status(409).json({ ok: false, error: '计划已确认，无需重复确认（库存未重复预留）', plan: serializePlan(db.getPlan(plan.id)) });
+  }
+  if (r.code === 'plan_canceled') return fail(res, 409, '计划已取消，不能确认；请新建计划');
+  if (r.code === 'material_missing') return fail(res, 409, '原材规格已不存在，无法确认');
+  if (r.code === 'material_changed') {
+    return fail(res, 409, '原材定尺自计划创建后已变化，请按新规格重建计划');
+  }
+  if (r.code === 'shortage') {
+    return res.status(409).json({
+      ok: false,
+      error: `可用原材不足：需用 ${r.required} 根，当前可用 ${r.available} 根，缺口 ${r.shortage} 根，不能确认`,
+      code: 'shortage',
+      requiredBars: r.required,
+      availableBars: r.available,
+      shortage: r.shortage,
+    });
+  }
+  res.json({ ok: true, plan: serializePlan(r.plan) });
+});
+
+// 取消：仅释放一次预留；重复取消不重复改库存
+app.post('/api/plans/:planId/cancel', (req, res) => {
+  const plan = db.getPlan(Number(req.params.planId));
+  if (!plan) return fail(res, 404, '生产计划不存在');
+  const r = db.cancelPlan(plan.id);
+  if (r.code === 'draft_not_reserved') {
+    return fail(res, 409, '草稿计划尚未预留库存，无需取消（可直接删除）');
+  }
+  if (r.code === 'already_canceled') {
+    return res.status(409).json({ ok: false, error: '计划已取消，库存此前已释放，未重复变更', plan: serializePlan(db.getPlan(plan.id)) });
+  }
+  res.json({ ok: true, plan: serializePlan(r.plan) });
+});
+
+// 删除草稿/已取消计划（已确认计划须先取消）
+app.delete('/api/plans/:planId', (req, res) => {
+  const r = db.deletePlan(Number(req.params.planId));
+  if (r.code === 'not_found') return fail(res, 404, '生产计划不存在');
+  if (r.code === 'confirmed_delete_blocked') {
+    return fail(res, 409, '已确认计划不能删除；请先取消以释放库存');
+  }
+  res.json({ ok: true });
+});
+
+function materialBrief(material) {
+  return {
+    id: material.id,
+    name: material.name,
+    length: material.length,
+    stock: material.stock,
+    reserved: material.reserved,
+    available: material.available,
+  };
+}
+
+function statusZh(status) {
+  return status === 'draft' ? '草稿' : status === 'confirmed' ? '已确认' : '已取消';
+}
+
+// 计划输出：绑定的发布版本与排产方案为快照；同时附带当前库存视图供网页展示
+function serializePlan(plan) {
+  const material = db.getMaterial(plan.materialId);
+  const shortage = Math.max(0, plan.requiredBars - (material ? material.available : 0));
+  return {
+    id: plan.id,
+    name: plan.name,
+    status: plan.status,
+    statusText: statusZh(plan.status),
+    publicationId: plan.publicationId,
+    designId: plan.designId,
+    version: plan.version,
+    copies: plan.copies,
+    kerf: plan.kerf,
+    requiredBars: plan.requiredBars,
+    segmentCount: plan.segmentCount,
+    layout: plan.layout,
+    material: material
+      ? materialBrief(material)
+      : { id: plan.materialId, name: plan.materialName, length: plan.materialLength, unavailable: true },
+    availableBars: material ? material.available : 0,
+    shortage: plan.status === 'draft' ? shortage : 0,
+    feasible: plan.status !== 'draft' || shortage === 0,
+    snapshotBound: true,
+    createdAt: plan.createdAt,
+    updatedAt: plan.updatedAt,
+    confirmedAt: plan.confirmedAt,
+    canceledAt: plan.canceledAt,
+  };
+}
+
 // 前端单页
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
@@ -259,9 +628,11 @@ app.use((err, req, res, next) => {
   fail(res, 500, '服务器内部错误');
 });
 
-app.listen(PORT, () => {
-  console.log(`彩绘玻璃拼片台已启动: http://localhost:${PORT}`);
-  console.log(`数据库文件: ${DB_PATH}`);
-});
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(PORT, () => {
+    console.log(`彩绘玻璃拼片台已启动: http://localhost:${PORT}`);
+    console.log(`数据库文件: ${DB_PATH}`);
+  });
+}
 
 module.exports = app;

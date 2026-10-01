@@ -675,6 +675,7 @@ function renderPublished() {
 
 document.getElementById('tabDraft').addEventListener('click', () => switchTab('draft'));
 document.getElementById('tabPublished').addEventListener('click', () => switchTab('published'));
+document.getElementById('tabProduction').addEventListener('click', () => switchTab('production'));
 document.getElementById('btnCreate').addEventListener('click', createDesign);
 document.getElementById('designSelect').addEventListener('change', (e) => loadDraft(Number(e.target.value)));
 document.getElementById('pubDesignSelect').addEventListener('change', loadPubVersions);
@@ -706,9 +707,12 @@ document.getElementById('btnPublish').addEventListener('click', publishDraft);
 function switchTab(which) {
   document.getElementById('tabDraft').classList.toggle('active', which === 'draft');
   document.getElementById('tabPublished').classList.toggle('active', which === 'published');
+  document.getElementById('tabProduction').classList.toggle('active', which === 'production');
   document.getElementById('viewDraft').hidden = which !== 'draft';
   document.getElementById('viewPublished').hidden = which !== 'published';
+  document.getElementById('viewProduction').hidden = which !== 'production';
   if (which === 'published') loadPubVersions();
+  if (which === 'production') enterProduction();
 }
 
 (async function init() {
@@ -724,3 +728,386 @@ function switchTab(which) {
     ctx.fillText('请在左侧“新建图纸”，输入正整数毫米的窗框宽高', canvas.width / 2, canvas.height / 2);
   }
 })();
+
+// ================= 铅条生产 =================
+
+const prod = {
+  materials: [],
+  designs: [],
+  publications: [],   // 选中图纸的发布版
+  plans: [],
+  detailPlan: null,   // 当前展示详情的计划
+};
+
+function prodBanner(kind, msg) {
+  const b = document.getElementById('prodBanner');
+  if (!kind) { b.hidden = true; b.textContent = ''; return; }
+  b.className = `banner ${kind === 'error' ? 'error' : 'success'}`;
+  b.hidden = false;
+  b.innerHTML = msg;
+  clearTimeout(prodBanner._t);
+  if (kind === 'success') prodBanner._t = setTimeout(() => { b.hidden = true; }, 3000);
+}
+
+async function enterProduction() {
+  prodBanner(false);
+  await Promise.all([loadMaterials(), refreshProdDesigns(), loadPlans()]);
+}
+
+// ---------- 库存 ----------
+
+async function loadMaterials() {
+  const data = await api('GET', '/api/materials');
+  prod.materials = data.materials;
+  renderMaterials();
+  renderMaterialOptions();
+}
+
+function renderMaterials() {
+  const el = document.getElementById('matList');
+  if (!prod.materials.length) {
+    el.innerHTML = '<div class="hint">尚未登记原材。</div>';
+    return;
+  }
+  let html = '<table><thead><tr><th>规格</th><th class="num">定尺</th><th class="num">库存</th><th class="num">已预留</th><th class="num">可用</th><th></th></tr></thead><tbody>';
+  for (const m of prod.materials) {
+    html += `<tr>
+      <td>${escapeHtml(m.name)}</td>
+      <td class="num">${fmt(m.length)}</td>
+      <td class="num">${m.stock}</td>
+      <td class="num">${m.reserved}</td>
+      <td class="num"><b>${m.available}</b></td>
+      <td><input type="number" min="0" step="1" value="${m.stock}" class="stock-edit" data-id="${m.id}" style="width:72px"></td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+  el.querySelectorAll('.stock-edit').forEach((inp) => {
+    inp.addEventListener('change', () => updateStock(Number(inp.dataset.id), Number(inp.value), inp));
+  });
+}
+
+function renderMaterialOptions() {
+  const sel = document.getElementById('planMaterialSelect');
+  const prev = sel.value;
+  sel.innerHTML = '';
+  for (const m of prod.materials) {
+    const opt = document.createElement('option');
+    opt.value = m.id;
+    opt.textContent = `${m.name}（定尺 ${fmt(m.length)} mm · 可用 ${m.available} 根）`;
+    sel.appendChild(opt);
+  }
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+}
+
+async function addMaterial() {
+  const msg = document.getElementById('matMsg');
+  const name = document.getElementById('matName').value;
+  const length = Number(document.getElementById('matLength').value);
+  const stock = Number(document.getElementById('matStock').value);
+  if (!name.trim()) { msg.textContent = '请填写规格名称'; return; }
+  try {
+    await api('POST', '/api/materials', { name, length, stock });
+    document.getElementById('matName').value = '';
+    msg.textContent = '✓ 已登记';
+    await loadMaterials();
+  } catch (err) { msg.textContent = '⛔ ' + err.message; }
+}
+
+async function updateStock(id, stock, inp) {
+  const msg = document.getElementById('matMsg');
+  if (!Number.isInteger(stock) || stock < 0) {
+    msg.textContent = '⛔ 库存根数必须是非负整数，输入已忽略';
+    await loadMaterials();
+    return;
+  }
+  try {
+    await api('PATCH', `/api/materials/${id}`, { stock });
+    msg.textContent = '✓ 库存已更新';
+    await loadMaterials();
+    await loadPlans();
+  } catch (err) {
+    msg.textContent = '⛔ ' + err.message;
+    await loadMaterials();
+  }
+}
+
+// ---------- 图纸/版本/规格选择 ----------
+
+async function refreshProdDesigns() {
+  const data = await api('GET', '/api/designs');
+  prod.designs = data.designs;
+  const sel = document.getElementById('planDesignSelect');
+  const prev = sel.value;
+  sel.innerHTML = '';
+  for (const d of prod.designs) {
+    const opt = document.createElement('option');
+    opt.value = d.id;
+    opt.textContent = d.latest_version
+      ? `${d.name}（最新 v${d.latest_version}）`
+      : `${d.name}（暂无发布版）`;
+    sel.appendChild(opt);
+  }
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  await loadPlanVersions();
+}
+
+async function loadPlanVersions() {
+  const sel = document.getElementById('planVersionSelect');
+  sel.innerHTML = '';
+  prod.publications = [];
+  const id = Number(document.getElementById('planDesignSelect').value);
+  if (!id) {
+    sel.innerHTML = '<option value="">（请先选择图纸）</option>';
+    return;
+  }
+  const data = await api('GET', `/api/designs/${id}/publications`);
+  prod.publications = data.publications;
+  if (!data.publications.length) {
+    sel.innerHTML = '<option value="">（该图纸暂无发布版）</option>';
+    return;
+  }
+  for (const p of data.publications) {
+    const opt = document.createElement('option');
+    // 列表接口只有 id/version/publishedAt；需要 publication 的完整 id
+    opt.value = p.id;
+    opt.textContent = `v${p.version} · ${p.publishedAt}`;
+    sel.appendChild(opt);
+  }
+}
+
+function selectedPlanInput() {
+  return {
+    publicationId: Number(document.getElementById('planVersionSelect').value),
+    materialId: Number(document.getElementById('planMaterialSelect').value),
+    copies: Number(document.getElementById('planCopies').value),
+    kerf: Number(document.getElementById('planKerf').value),
+  };
+}
+
+// ---------- 预览 ----------
+
+async function previewPlan() {
+  const body = selectedPlanInput();
+  if (!body.publicationId) { showPreviewHint('请先发布图纸，再选择发布版本。'); return; }
+  if (!body.materialId) { showPreviewHint('请先登记原材规格。'); return; }
+  try {
+    const data = await api('POST', '/api/plans/preview', body);
+    prod.detailPlan = null;
+    renderLayout(data.preview, { preview: true });
+    prodBanner(false);
+  } catch (err) {
+    const d = err.data || {};
+    let txt = '⛔ ' + (d.error || err.message);
+    if (d.segment) txt += `（${d.segment.name}：成品 ${fmt(d.segment.length)} mm，含刀损 ${fmt(d.segment.withKerf)} mm，超过原材定尺）`;
+    prodBanner('error', txt);
+    showPreviewHint(txt.replace('⛔ ', ''));
+  }
+}
+
+function showPreviewHint(text) {
+  document.getElementById('previewContent').innerHTML =
+    `<div class="hint">${escapeHtml(text)}</div>`;
+}
+
+// detail: { preview:true } 或 { plan:obj }
+function renderLayout(detail, mode) {
+  const p = mode.preview ? detail : detail.plan;
+  const L = p.layout;
+  const isPreview = !!mode.preview;
+  let html = '';
+
+  html += `<div class="plan-head">
+    <div><b>${isPreview ? '排产预览（不落库、不占库存）' : `计划 #${p.id} · ${escapeHtml(p.name)}`}</b></div>
+    <div class="muted">发布版 v${p.version} · ${p.copies} 件 ·
+      原材 ${escapeHtml(p.material ? p.material.name : '')}（定尺 ${fmt(L.materialLength)} mm）·
+      每刀损耗 ${fmt(L.kerf)} mm</div></div>`;
+
+  // 库存结论
+  if (isPreview || p.status === 'draft') {
+    const need = L.requiredBars, avail = p.availableBars ?? detail.availableBars;
+    const shortage = p.shortage ?? detail.shortage ?? Math.max(0, need - avail);
+    if (shortage > 0) {
+      html += `<div class="stock-badge bad">⚠ 需用 <b>${need}</b> 根，可用 <b>${avail}</b> 根，缺口 <b>${shortage}</b> 根——不能确认</div>`;
+    } else {
+      html += `<div class="stock-badge ok">✓ 需用 <b>${need}</b> 根，可用 <b>${avail}</b> 根，库存充足（预览不占库存）</div>`;
+    }
+  } else {
+    html += `<div class="stock-badge ${p.status === 'confirmed' ? 'ok' : 'cancel'}">
+      ${p.status === 'confirmed' ? '✓ 已确认（库存已原子预留）' : '已取消（预留已释放）'}</div>`;
+  }
+
+  html += `<div class="muted">共 ${L.totals.segmentCount} 段；成品合计 ${fmt(L.totals.finishedLength)} mm，
+    刀损合计 ${fmt(L.totals.kerfTotal)} mm，余料合计 ${fmt(L.totals.remainderTotal)} mm。</div>`;
+
+  html += '<div class="bars">';
+  for (const bar of L.bars) {
+    html += `<div class="bar-card">
+      <div class="bar-title">原材 #${bar.index} · 用 ${fmt(bar.usedLength)} mm · 余料 <b>${fmt(bar.remainder)}</b> mm</div>
+      <div class="bar-track">${barTrack(bar, L.materialLength)}</div>
+      <table><thead><tr><th>件次</th><th>切段</th><th class="num">成品</th><th class="num">刀损</th></tr></thead><tbody>`;
+    for (const c of bar.cuts) {
+      html += `<tr><td>第 ${c.piece} 件</td><td>${sourceLabel(c)}</td>
+        <td class="num">${fmt(c.length)}</td><td class="num muted">${fmt(c.kerf)}</td></tr>`;
+    }
+    html += '</tbody></table></div>';
+  }
+  html += '</div>';
+
+  if (isPreview) {
+    html += `<div class="btn-row"><button id="btnSaveDraft" class="primary">存为草稿计划</button></div>`;
+  } else if (p.status === 'draft') {
+    html += `<div class="btn-row">
+      <button id="btnPlanConfirm" class="primary">确认计划（预留 ${L.requiredBars} 根）</button>
+      <button id="btnPlanDelete" class="danger">删除草稿</button>
+      <button id="btnPlanReedit">按此参数重新编辑</button></div>`;
+  } else if (p.status === 'confirmed') {
+    html += `<div class="btn-row"><button id="btnPlanCancel" class="danger">取消计划（释放预留）</button></div>`;
+  }
+
+  document.getElementById('previewContent').innerHTML = html;
+
+  const saveBtn = document.getElementById('btnSaveDraft');
+  if (saveBtn) saveBtn.addEventListener('click', () => saveDraft(detail));
+  const cf = document.getElementById('btnPlanConfirm');
+  if (cf) cf.addEventListener('click', () => confirmPlan(p.id));
+  const de = document.getElementById('btnPlanDelete');
+  if (de) de.addEventListener('click', () => deletePlan(p.id));
+  const ca = document.getElementById('btnPlanCancel');
+  if (ca) ca.addEventListener('click', () => cancelPlan(p.id));
+  const re = document.getElementById('btnPlanReedit');
+  if (re) re.addEventListener('click', () => fillEditorFromPlan(p));
+}
+
+function sourceLabel(c) {
+  const tail = c.from && c.to
+    ? ` <span class="muted small">(${c.from[0]},${c.from[1]})→(${c.to[0]},${c.to[1]})</span>`
+    : '';
+  return `${c.name}${tail}`;
+}
+
+// 简单的余料比例条
+function barTrack(bar, totalLen) {
+  let pct = 0, acc = 0;
+  const colors = ['#4C9AFF', '#FFAB00', '#36B37E', '#FF5630', '#6554C0', '#00B8D9'];
+  let html = '<div class="track">';
+  bar.cuts.forEach((c, i) => {
+    const w = (c.length + c.kerf) / totalLen * 100;
+    html += `<div class="seg" style="left:${acc}%;width:${w}%;background:${colors[i % colors.length]}"
+      title="第${c.piece}件 ${c.name} ${fmt(c.length)} + ${fmt(c.kerf)}"></div>`;
+    acc += w;
+  });
+  pct = acc;
+  html += `<div class="rem" style="left:${pct}%;width:${100 - pct}%"></div></div>`;
+  return html;
+}
+
+// ---------- 草稿保存 / 确认 / 取消 / 删除 ----------
+
+async function saveDraft(preview) {
+  const name = document.getElementById('planName').value;
+  try {
+    const data = await api('POST', '/api/plans', {
+      name: name || undefined,
+      publicationId: preview.publicationId,
+      materialId: preview.material.id,
+      copies: preview.copies,
+      kerf: preview.kerf,
+    });
+    prodBanner('success', `✓ 已存为草稿计划 #${data.plan.id}（尚未占用库存）`);
+    await loadPlans(data.plan.id);
+  } catch (err) { prodBanner('error', '⛔ ' + err.message); }
+}
+
+async function confirmPlan(id) {
+  try {
+    const data = await api('POST', `/api/plans/${id}/confirm`);
+    prodBanner('success', `✓ 计划 #${id} 已确认，预留 ${data.plan.requiredBars} 根`);
+    await loadMaterials();
+    await loadPlans(id);
+  } catch (err) {
+    const d = err.data || {};
+    prodBanner('error', '⛔ ' + (d.error || err.message));
+    await loadMaterials();
+    await loadPlans(id);
+  }
+}
+
+async function cancelPlan(id) {
+  if (!confirm(`确定取消计划 #${id}？已预留的根数将释放。`)) return;
+  try {
+    const data = await api('POST', `/api/plans/${id}/cancel`);
+    prodBanner('success', `计划 #${id} 已取消，释放 ${data.plan.requiredBars} 根`);
+    await loadMaterials();
+    await loadPlans(id);
+  } catch (err) { prodBanner('error', '⛔ ' + err.message); await loadPlans(id); }
+}
+
+async function deletePlan(id) {
+  if (!confirm(`确定删除草稿计划 #${id}？`)) return;
+  try {
+    await api('DELETE', `/api/plans/${id}`);
+    prodBanner('success', `草稿 #${id} 已删除`);
+    prod.detailPlan = null;
+    showPreviewHint('草稿已删除。');
+    await loadPlans();
+  } catch (err) { prodBanner('error', '⛔ ' + err.message); }
+}
+
+function fillEditorFromPlan(p) {
+  document.getElementById('planDesignSelect').value = p.designId;
+  document.getElementById('planCopies').value = p.copies;
+  document.getElementById('planKerf').value = p.kerf;
+  loadPlanVersions().then(() => {
+    document.getElementById('planVersionSelect').value = p.publicationId;
+    document.getElementById('planMaterialSelect').value = p.materialId;
+  });
+}
+
+// ---------- 计划列表 ----------
+
+async function loadPlans(selectId) {
+  const data = await api('GET', '/api/plans');
+  prod.plans = data.plans;
+  renderPlanList();
+  if (selectId) {
+    const p = prod.plans.find((x) => x.id === selectId);
+    if (p) renderLayout({ plan: p }, { preview: false });
+  }
+}
+
+function renderPlanList() {
+  const el = document.getElementById('planList');
+  if (!prod.plans.length) {
+    el.innerHTML = '<div class="hint">暂无计划。</div>';
+    return;
+  }
+  el.innerHTML = prod.plans.map((p) => {
+    const badge = p.status === 'confirmed'
+      ? '<span class="badge ok">已确认</span>'
+      : p.status === 'canceled'
+        ? '<span class="badge bad" style="background:#eee;color:#888">已取消</span>'
+        : '<span class="badge bad">草稿</span>';
+    const warn = p.status === 'draft' && p.shortage > 0
+      ? ` <span class="gap-info">缺 ${p.shortage} 根</span>` : '';
+    return `<div class="plan-item${prod.detailPlan === p.id ? ' active' : ''}" data-id="${p.id}">
+      <div>${badge} <b>#${p.id}</b> ${escapeHtml(p.name)}${warn}</div>
+      <div class="muted small">v${p.version} · ${p.copies}件 · 用 ${p.requiredBars} 根 ·
+        ${escapeHtml(p.material ? p.material.name : '规格已删')}</div>
+    </div>`;
+  }).join('');
+  el.querySelectorAll('.plan-item').forEach((div) => {
+    div.addEventListener('click', () => {
+      const p = prod.plans.find((x) => x.id === Number(div.dataset.id));
+      prod.detailPlan = p.id;
+      renderPlanList();
+      renderLayout({ plan: p }, { preview: false });
+    });
+  });
+}
+
+// ---------- 事件绑定 ----------
+
+document.getElementById('btnMatAdd').addEventListener('click', addMaterial);
+document.getElementById('planDesignSelect').addEventListener('change', loadPlanVersions);
+document.getElementById('btnPlanPreview').addEventListener('click', previewPlan);
