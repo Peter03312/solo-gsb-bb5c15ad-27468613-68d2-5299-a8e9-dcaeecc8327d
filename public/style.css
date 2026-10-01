@@ -168,3 +168,33 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .gap-info { font-size: 12px; color: #8a5a00; line-height: 1.6; }
 
 .pub-link { color: var(--primary); }
+
+/* ---------- 铅条生产 ---------- */
+#viewProduction .canvas-wrap { flex: 1; min-width: 0; overflow-x: auto; }
+.cutting-head {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 12px 16px; margin-bottom: 12px;
+}
+.cutting-head h2 { font-size: 15px; margin: 0 0 6px; color: var(--primary); }
+.box { padding: 8px 12px; border-radius: 6px; margin: 8px 0; font-size: 13px; }
+.msg-ok { color: var(--ok); }
+.msg-warn { color: #8a5a00; }
+.msg-err { color: var(--danger); }
+.hint.msg-ok { background: var(--ok-bg); }
+.hint.msg-warn { background: var(--warn-bg); }
+.hint.msg-err { background: var(--danger-bg); }
+.bin-card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 14px; margin-bottom: 10px;
+}
+.bin-card h3 { font-size: 13px; margin: 2px 0 8px; color: var(--ink); }
+.plan-status {
+  display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px;
+}
+.plan-status.draft { background: #ece8de; color: #6d6558; }
+.plan-status.confirmed { background: var(--ok-bg); color: var(--ok); }
+.plan-status.cancelled { background: var(--danger-bg); color: var(--danger); }
+.plan-link { color: var(--primary); text-decoration: none; font-weight: 600; }
+.plan-link:hover { text-decoration: underline; }
+.icon-btn.confirm:hover { background: var(--ok-bg); }
+.icon-btn.cancel:hover { background: var(--danger-bg); }
